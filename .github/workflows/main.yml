@@ -1,38 +1,127 @@
 name: Build KernelSU for Xiaomi MI 8 (dipper)
+
 on:
   workflow_dispatch:
+    inputs:
+      kernelsu_version:
+        description: 'KernelSU版本 (tag)'
+        required: true
+        default: 'v1.0.2'
+        type: string
+
+env:
+  # 内核源码配置
+  KERNEL_REPO: "https://github.com/LineageOS/android_kernel_xiaomi_sdm845.git"
+  KERNEL_BRANCH: "lineage-18.1"
+  DEFCONFIG: "sdm845_defconfig"
+  # 编译器配置 - r365631c 是编译 4.9 内核最稳妥的 Clang 版本
+  CLANG_VERSION: "r365631c"
+  # 设备代号
+  DEVICE: "dipper"
 
 jobs:
-  build-kernel:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout kernel source
-        uses: actions/checkout@v4
-        with:
-          repository: LineageOS/android_kernel_xiaomi_sdm845
-          ref: lineage-18.1
-          path: kernel
+    # 1. 安装基础编译依赖
+    - name: Install Dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y git make bc bison flex libssl-dev build-essential zip
 
-      - name: Setup KernelSU
-        run: |
-          cd kernel
-          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
-          # 启用 KernelSU 必需的配置
-          echo "CONFIG_KPROBES=y" >> arch/arm64/configs/sdm845_defconfig
-          echo "CONFIG_HAVE_KPROBES=y" >> arch/arm64/configs/sdm845_defconfig
-          echo "CONFIG_KPROBE_EVENTS=y" >> arch/arm64/configs/sdm845_defconfig
+    # 2. 克隆内核源码
+    - name: Checkout Kernel Source
+      uses: actions/checkout@v4
+      with:
+        repository: LineageOS/android_kernel_xiaomi_sdm845
+        ref: lineage-18.1
+        path: kernel
 
-      - name: Build kernel
-        uses: KernelSU/KernelSU-Action@main
-        with:
-          arch: arm64
-          defconfig: sdm845_defconfig
-          compiler: clang
-          clang-version: r365631c
-          kernel-dir: kernel
+    # 3. 设置Clang编译器
+    - name: Setup Clang
+      run: |
+        mkdir -p clang
+        cd clang
+        # 从Google的AOSP仓库下载指定版本的Clang
+        echo "Downloading Clang ${{ env.CLANG_VERSION }}..."
+        wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${{ env.CLANG_VERSION }}.tar.gz
+        tar -xzf clang-${{ env.CLANG_VERSION }}.tar.gz
+        # 设置环境变量，让后续步骤使用这个Clang
+        echo "$(pwd)/bin" >> $GITHUB_PATH
+        echo "PATH=$(pwd)/bin:$PATH" >> $GITHUB_ENV
 
-      - name: Upload AnyKernel3 zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: boot
-          path: out/AnyKernel3.zip
+    # 4. 设置GCC交叉编译工具链
+    - name: Setup GCC Toolchains
+      run: |
+        sudo apt install -y gcc-aarch64-linux-gnu
+
+    # 5. 集成KernelSU源码
+    - name: Integrate KernelSU
+      run: |
+        cd kernel
+        echo "Integrating KernelSU version: ${{ github.event.inputs.kernelsu_version }}"
+        # 运行KernelSU官方的集成脚本，传入指定的版本tag
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s ${{ github.event.inputs.kernelsu_version }}
+        # 将KernelSU的配置选项添加到内核配置文件中，这是启用KernelSU的关键
+        echo "CONFIG_KSU=y" >> arch/arm64/configs/${{ env.DEFCONFIG }}
+        echo "CONFIG_KPROBES=y" >> arch/arm64/configs/${{ env.DEFCONFIG }}
+        echo "CONFIG_HAVE_KPROBES=y" >> arch/arm64/configs/${{ env.DEFCONFIG }}
+        echo "CONFIG_KPROBE_EVENTS=y" >> arch/arm64/configs/${{ env.DEFCONFIG }}
+
+    # 6. 开始编译内核
+    - name: Compile Kernel
+      run: |
+        cd kernel
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        # 使用我们设置好的Clang进行编译
+        export PATH="${GITHUB_WORKSPACE}/clang/bin:${PATH}"
+        export CC=clang
+        # 生成配置
+        make ${{ env.DEFCONFIG }}
+        # 开始编译，使用全部CPU核心以加快速度
+        make -j$(nproc)
+
+    # 7. 准备AnyKernel3打包工具
+    - name: Setup AnyKernel3
+      run: |
+        git clone https://github.com/osm0sis/AnyKernel3.git -b master
+        cp AnyKernel3/anykernel.sh AnyKernel3/anykernel.sh.bak
+        cat > AnyKernel3/anykernel.sh << 'EOF'
+        # AnyKernel3 脚本 - 用于小米8 (dipper)
+        kernel.string=KernelSU for $DEVICE - $KERNELSU_VERSION
+        do.devicecheck=1
+        do.modules=0
+        do.cleanup=1
+        do.cleanuponabort=1
+        device.name1=dipper
+        block=boot
+        is_slot_device=0
+        ramdisk_compression=auto
+        patch_vbmeta_flag=auto
+        EOF
+
+    # 8. 打包最终的刷机包 (boot.zip)
+    - name: Package AnyKernel3
+      run: |
+        # 复制编译好的内核镜像到AnyKernel3目录
+        cp kernel/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+        # 如果有dtb或dtbo文件，也一并复制
+        if [ -f kernel/arch/arm64/boot/dtbo.img ]; then
+          cp kernel/arch/arm64/boot/dtbo.img AnyKernel3/
+        fi
+        if [ -f kernel/arch/arm64/boot/dtb.img ]; then
+          cp kernel/arch/arm64/boot/dtb.img AnyKernel3/
+        fi
+        # 进入目录并打包
+        cd AnyKernel3
+        zip -r9 ../boot.zip * .[^.]* -x "*.git*" >> /dev/null
+        cd ..
+        echo "Packaging complete. Output file: boot.zip"
+
+    # 9. 上传最终的刷机包 (boot.zip)
+    - name: Upload boot.zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: KernelSU-boot-for-${{ env.DEVICE }}
+        path: boot.zip
