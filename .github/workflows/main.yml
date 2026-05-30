@@ -1,22 +1,38 @@
 name: Build KernelSU for Xiaomi MI 8 (dipper)
-
 on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-kernel:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout KernelSU Action
-      uses: actions/checkout@main
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_kernel_xiaomi_sdm845
+          ref: lineage-18.1
+          path: kernel
 
-    - name: KernelSU build
-      uses: xiaoleGun/KernelSU_Action@main
-      with:
-        kernel_url: "https://github.com/LineageOS/android_kernel_xiaomi_sdm845.git"
-        kernel_branch: "lineage-18.1"
-        defconfig: "sdm845_defconfig"
-        anykernel3: "true"
-        enable_kernelsu: "true"
-        kernelsu_version: "v1.0.2"
-        clang_version: "r365631c"
+      - name: Setup KernelSU
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          # 启用 KernelSU 必需的配置
+          echo "CONFIG_KPROBES=y" >> arch/arm64/configs/sdm845_defconfig
+          echo "CONFIG_HAVE_KPROBES=y" >> arch/arm64/configs/sdm845_defconfig
+          echo "CONFIG_KPROBE_EVENTS=y" >> arch/arm64/configs/sdm845_defconfig
+
+      - name: Build kernel
+        uses: KernelSU/KernelSU-Action@main
+        with:
+          arch: arm64
+          defconfig: sdm845_defconfig
+          compiler: clang
+          clang-version: r365631c
+          kernel-dir: kernel
+
+      - name: Upload AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot
+          path: out/AnyKernel3.zip
